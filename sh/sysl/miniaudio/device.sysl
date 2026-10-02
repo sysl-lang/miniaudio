@@ -138,6 +138,9 @@ struct Device
         if self.open then Ok(self.raw) else Err(Error(c.DEVICE_NOT_INITIALIZED))
 
     private base(self) -> *u8 = ptr_cast(self.raw)
+
+    // miniaudio's struct, for a test to read a field the binding does not surface.
+    private[miniaudio] raw_base(self) -> *u8 = ptr_cast(self.raw)
 end Device
 
 // `ma_device_uninit` stops the device and joins its thread, so once it returns nothing calls back and

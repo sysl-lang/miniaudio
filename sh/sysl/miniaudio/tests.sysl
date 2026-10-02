@@ -1,6 +1,7 @@
 module sh.sysl.miniaudio
 @tests
 
+import sh.sysl.miniaudio.c
 import sysl.sync.Atomic
 import sysl.posix.time.sleep
 import sysl.time.millis
@@ -77,19 +78,21 @@ null_enumeration()
 // -- Playback --------------------------------------------------------------------------------------
 
 // The fixed-size callback is miniaudio's default, so every call carries exactly the period asked
-// for; the buffer holds a sample per channel per frame; and it arrives silent.
+// for; the buffer holds a sample per channel per frame; and it arrives silent. The period is 300
+// because the backend's own choice at 48 kHz is 480 -- ten milliseconds -- and a fixture asking for
+// that could not tell a period that arrived from one that did not.
 @test("playback hands the callback the period, channel count and format asked for")
 playback_shape()
     val ctx = context([Null]).unwrap()
     val t = tally()
 
-    val d = ctx.playback(stream(F32, 2), 48000, period_frames = 480, cb = (f: Frames) ->
+    val d = ctx.playback(stream(F32, 2), 48000, period_frames = 300, cb = (f: Frames) ->
         val out = f.output_f32()
 
         t.calls.add(1)
         t.frames.add(u64(f.count))
 
-        if f.count != 480 || out.len != 960 || f.output_channels != 2 then t.wrong.add(1)
+        if f.count != 300 || out.len != 600 || f.output_channels != 2 then t.wrong.add(1)
 
         for s in out
             if s != 0.0 then t.loud.add(1)
@@ -111,7 +114,7 @@ playback_shape()
     assert(t.calls.load() > 1)
     assert_eq(t.wrong.load(), 0)
     assert_eq(t.loud.load(), 0)
-    assert_eq(t.frames.load(), t.calls.load() * 480)
+    assert_eq(t.frames.load(), t.calls.load() * 300)
 
 // The null backend paces itself by the clock at the device's rate, so the frames consumed over a
 // stretch of time say which rate arrived. 8000 is far enough from every default that a rate which
@@ -165,13 +168,27 @@ native_format()
     assert(d.playback_channels() > 0)
     assert(d.sample_rate() > 0)
 
-@test("a device chosen from the enumeration is the one opened")
+// The null backend has one device each way, so the name opened is the same whichever way it was
+// asked for. What says the id arrived is miniaudio's own record of it: `playback.pID` is null for
+// the default device and points at its copy of the id for an explicit one.
+@test("a device chosen from the enumeration is opened by its id")
 chosen_device()
     val ctx = context([Null]).unwrap()
     val info = ctx.playback_devices().unwrap()[0]
-    val d = ctx.playback(stream(F32, 2, Some(info)), 48000, (f: Frames) -> ()).unwrap()
+    val chosen = ctx.playback(stream(F32, 2, Some(info)), 48000, (f: Frames) -> ()).unwrap()
+    val default = ctx.playback(stream(F32, 2), 48000, (f: Frames) -> ()).unwrap()
 
-    assert_eq(d.playback_hardware().name, info.name)
+    assert_eq(chosen.playback_hardware().name, info.name)
+    assert(read[*u8](chosen.raw_base(), c.DEV_PLAYBACK_ID) != null)
+    assert(read[*u8](default.raw_base(), c.DEV_PLAYBACK_ID) == null)
+
+@test("a capture device chosen from the enumeration is opened by its id")
+chosen_capture_device()
+    val ctx = context([Null]).unwrap()
+    val info = ctx.capture_devices().unwrap()[0]
+    val chosen = ctx.capture(stream(F32, 1, Some(info)), 48000, (f: Frames) -> ()).unwrap()
+
+    assert(read[*u8](chosen.raw_base(), c.DEV_CAPTURE_ID) != null)
 
 // -- Capture and duplex ----------------------------------------------------------------------------
 
@@ -180,12 +197,12 @@ capture_shape()
     val ctx = context([Null]).unwrap()
     val t = tally()
 
-    val d = ctx.capture(stream(S32, 3), 16000, period_frames = 160, cb = (f: Frames) ->
+    val d = ctx.capture(stream(S32, 3), 16000, period_frames = 100, cb = (f: Frames) ->
         val inp = f.input_s32()
 
         t.calls.add(1)
 
-        if f.count != 160 || inp.len != 480 || f.input_format != S32 then t.wrong.add(1)
+        if f.count != 100 || inp.len != 300 || f.input_format != S32 then t.wrong.add(1)
 
         for s in inp
             if s != 0 then t.loud.add(1)).unwrap()

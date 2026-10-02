@@ -107,8 +107,9 @@ c const
 // data callback finds its way home through.
 c const
     DEV_USER_DATA:   usize = "offsetof(ma_device, pUserData)"
-    DEV_TYPE:        usize = "offsetof(ma_device, type)"
     DEV_SAMPLE_RATE: usize = "offsetof(ma_device, sampleRate)"
+    DEV_PLAYBACK_ID: usize = "offsetof(ma_device, playback.pID)"
+    DEV_CAPTURE_ID:  usize = "offsetof(ma_device, capture.pID)"
 
     DEV_PLAYBACK_NAME:              usize = "offsetof(ma_device, playback.name)"
     DEV_PLAYBACK_FORMAT:            usize = "offsetof(ma_device, playback.format)"
