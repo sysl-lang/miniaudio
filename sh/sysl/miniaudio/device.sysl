@@ -1,0 +1,278 @@
+// One open device, and the buffers its callback is handed.
+//
+//     val d = ctx.playback(stream(S16, 1), 44100, (f: Frames) ->
+//         val out = f.output_s16()                  // f.count frames, one sample each
+//         ...
+//     )?
+//
+//     d.start()?
+//     ...
+//     d.stop()?
+//
+// **The callback runs on miniaudio's audio thread, once per period, for as long as the device is
+// started.** It is handed a `Frames` that is only valid until it returns. On a playback device the
+// output buffer arrives silent, so a callback that writes nothing plays nothing.
+//
+// **A device keeps playing for as long as something holds it**: dropping the last `&Device` stops it
+// and joins the audio thread before its storage goes, and so does `close`.
+
+module sh.sysl.miniaudio
+
+import sh.sysl.miniaudio.c
+
+/** Where a device is in its life. `Starting` and `Stopping` are only ever seen from another thread
+ * while `start` or `stop` is in progress.
+ */
+enum State
+    Uninitialized
+    Stopped
+    Started
+    Starting
+    Stopping
+
+/** A state prints as its name in lower case -- `started`, `stopped`. */
+impl Display for State
+    display(self, out: *Writer, fmt: FormatSpec)
+        val name = self match
+            Uninitialized -> "uninitialized"
+            Stopped -> "stopped"
+            Started -> "started"
+            Starting -> "starting"
+            Stopping -> "stopping"
+
+        display_str(name, out, fmt)
+
+/** What the backend actually opened for one side of a device: miniaudio converts between this and
+ * the format, channel count and rate the program asked for, so these may differ from them.
+ */
+struct Hardware
+    name: string
+    format: Format
+    channels: u32
+    sample_rate: u32
+    period_frames: u32
+    periods: u32
+
+/** An open device. Reached through `&Device`; see the module comment for its lifetime. */
+struct Device
+    private raw: *c.Device
+    private open: bool
+    private ctx: &Context
+    private on_data: &sync Fn(Frames) -> unit
+
+    /** Begin calling the data callback. Starting a started device does nothing and answers `Ok`. */
+    start(self) -> Result[unit, Error] = checked(c.device_start(self.live()?))
+
+    /** Stop calling it. When this returns, the callback is not running and will not run again until
+     * the next `start`.
+     */
+    stop(self) -> Result[unit, Error] = checked(c.device_stop(self.live()?))
+
+    /** Whether the callback is being called. */
+    is_started(self) -> bool = c.device_is_started(self.raw) != 0
+
+    /** Where the device is in its life. A closed device is `Uninitialized`. */
+    state(self) -> State
+        val s = c.device_get_state(self.raw)
+
+        if s == c.STATE_STOPPED then Stopped
+        else if s == c.STATE_STARTED then Started
+        else if s == c.STATE_STARTING then Starting
+        else if s == c.STATE_STOPPING then Stopping
+        else Uninitialized
+
+    /** The rate the callback's frames are at -- the one asked for, or the device's own if `0` was.
+     * This and the readings below it answer zero once the device is closed.
+     */
+    sample_rate(self) -> u32 = read(self.base(), c.DEV_SAMPLE_RATE)
+
+    /** The format of the output buffer the callback fills. */
+    playback_format(self) -> Format = format_of(read(self.base(), c.DEV_PLAYBACK_FORMAT))
+
+    /** The channel count of the output buffer the callback fills. */
+    playback_channels(self) -> u32 = read(self.base(), c.DEV_PLAYBACK_CHANNELS)
+
+    /** The format of the input buffer the callback reads. */
+    capture_format(self) -> Format = format_of(read(self.base(), c.DEV_CAPTURE_FORMAT))
+
+    /** The channel count of the input buffer the callback reads. */
+    capture_channels(self) -> u32 = read(self.base(), c.DEV_CAPTURE_CHANNELS)
+
+    /** What the backend opened for playback. */
+    playback_hardware(self) -> Hardware =
+        hardware(self.base(), c.DEV_PLAYBACK_NAME, c.DEV_PLAYBACK_INTERNAL_FORMAT,
+                 c.DEV_PLAYBACK_INTERNAL_CHANNELS, c.DEV_PLAYBACK_INTERNAL_RATE,
+                 c.DEV_PLAYBACK_INTERNAL_PERIOD, c.DEV_PLAYBACK_INTERNAL_PERIODS)
+
+    /** What the backend opened for capture. */
+    capture_hardware(self) -> Hardware =
+        hardware(self.base(), c.DEV_CAPTURE_NAME, c.DEV_CAPTURE_INTERNAL_FORMAT,
+                 c.DEV_CAPTURE_INTERNAL_CHANNELS, c.DEV_CAPTURE_INTERNAL_RATE,
+                 c.DEV_CAPTURE_INTERNAL_PERIOD, c.DEV_CAPTURE_INTERNAL_PERIODS)
+
+    /** The context this device was opened from. */
+    context(self) -> &Context = self.ctx
+
+    /** The linear gain miniaudio applies to the output; `1.0` is unchanged. */
+    volume(self) -> Result[f32, Error]
+        var v: f32 = 0.0
+
+        checked(c.device_get_master_volume(self.live()?, &v))?
+        Ok(v)
+
+    /** Set that gain. A negative one is `INVALID_ARGS`. */
+    set_volume(self, v: f32) -> Result[unit, Error] = checked(c.device_set_master_volume(self.live()?, v))
+
+    /** Stop the device and release the backend's hold on it now, rather than when the last reference
+     * goes. `start`, `stop` and the volume answer `DEVICE_NOT_INITIALIZED` after this; a second
+     * `close` does nothing.
+     */
+    close(*self)
+        if !self.open then return
+
+        c.device_uninit(self.raw)
+        self.open = false
+        self.on_data = silent
+
+    private live(self) -> Result[*c.Device, Error] =
+        if self.open then Ok(self.raw) else Err(Error(c.DEVICE_NOT_INITIALIZED))
+
+    private base(self) -> *u8 = ptr_cast(self.raw)
+end Device
+
+// `ma_device_uninit` stops the device and joins its thread, so once it returns nothing calls back and
+// the storage can go.
+impl Drop for Device
+    drop(self)
+        if self.open then c.device_uninit(self.raw)
+
+        c.free(ptr_cast(self.raw), null)
+
+private silent(f: Frames) -> unit = ()
+
+private hardware(base: *u8, name: usize, format: usize, channels: usize, rate: usize, period: usize,
+                 periods: usize) -> Hardware =
+    Hardware(read_name(base, name), format_of(read(base, format)), read(base, channels),
+             read(base, rate), read(base, period), read(base, periods))
+
+/** One period, as the data callback sees it. Valid only until the callback returns.
+ *
+ * `count` is frames, not samples: an output buffer holds `count * output_channels` samples,
+ * interleaved. Each typed view panics when the device's format is not that type -- a callback is
+ * written for the format it opened, and reading `S16` samples as `f32` is a bug to stop at once
+ * rather than noise to play.
+ */
+struct Frames
+    count: u32
+    output_format: Format
+    output_channels: u32
+    input_format: Format
+    input_channels: u32
+    private out: *u8
+    private inp: *u8
+
+    /** The output buffer as `f32` samples, for an `F32` device. */
+    output_f32(self) -> []f32 = view(self.out, F32, self.output_format, self.count * self.output_channels)
+
+    /** The output buffer as `i16` samples, for an `S16` device. */
+    output_s16(self) -> []i16 = view(self.out, S16, self.output_format, self.count * self.output_channels)
+
+    /** The output buffer as `i32` samples, for an `S32` device. */
+    output_s32(self) -> []i32 = view(self.out, S32, self.output_format, self.count * self.output_channels)
+
+    /** The output buffer as `u8` samples, for a `U8` device. */
+    output_u8(self) -> []u8 = view(self.out, U8, self.output_format, self.count * self.output_channels)
+
+    /** The output buffer as raw bytes, whatever the format -- the only view of an `S24` one. */
+    output_bytes(self) -> []u8 =
+        view(self.out, self.output_format, self.output_format,
+             self.count * self.output_channels * bytes_per_sample(self.output_format))
+
+    /** The input buffer as `f32` samples, for an `F32` device. */
+    input_f32(self) -> []const f32 = read_view(self.inp, F32, self.input_format, self.count * self.input_channels)
+
+    /** The input buffer as `i16` samples, for an `S16` device. */
+    input_s16(self) -> []const i16 = read_view(self.inp, S16, self.input_format, self.count * self.input_channels)
+
+    /** The input buffer as `i32` samples, for an `S32` device. */
+    input_s32(self) -> []const i32 = read_view(self.inp, S32, self.input_format, self.count * self.input_channels)
+
+    /** The input buffer as `u8` samples, for a `U8` device. */
+    input_u8(self) -> []const u8 = read_view(self.inp, U8, self.input_format, self.count * self.input_channels)
+
+    /** The input buffer as raw bytes, whatever the format. */
+    input_bytes(self) -> []const u8 =
+        read_view(self.inp, self.input_format, self.input_format,
+                  self.count * self.input_channels * bytes_per_sample(self.input_format))
+end Frames
+
+private view[T](p: *u8, wanted: Format, actual: Format, n: u32) -> []T
+    checked_view(p, wanted, actual)
+
+    var q: *T = ptr_cast(p)
+    q[0..<usize(n)]
+
+private read_view[T](p: *u8, wanted: Format, actual: Format, n: u32) -> []const T
+    checked_view(p, wanted, actual)
+
+    val q: *T = ptr_cast(p)
+    q[0..<usize(n)]
+
+private checked_view(p: *u8, wanted: Format, actual: Format)
+    if p == null then panic("this device has no buffer on that side")
+    if wanted != actual then panic("the buffer is not in the format this view reads")
+
+// Called on miniaudio's audio thread. `pUserData` holds the address of the sysl `Device`, set before
+// `ma_device_init`; everything else is read from miniaudio's own struct, which it filled in before
+// the thread could call this.
+private on_data(dev: *c.Device, out: *u8, inp: *u8, count: u32) -> unit
+    val base: *u8 = ptr_cast(dev)
+    val d: *Device = read(base, c.DEV_USER_DATA)
+
+    d.on_data(Frames(count, format_of(read(base, c.DEV_PLAYBACK_FORMAT)),
+                     read(base, c.DEV_PLAYBACK_CHANNELS), format_of(read(base, c.DEV_CAPTURE_FORMAT)),
+                     read(base, c.DEV_CAPTURE_CHANNELS), out, inp))
+
+private[miniaudio] open_device(ctx: &Context, kind: i32, out: Stream, inp: Stream, sample_rate: u32,
+                               period_frames: u32, cb: &sync Fn(Frames) -> unit) -> Result[&Device, Error]
+    val raw: *c.Device = ptr_cast(c.calloc(c.DEVICE_SIZE, null))
+
+    if raw == null then return Err(Error(c.OUT_OF_MEMORY))
+
+    var d: &Device = Device(raw, false, ctx, cb)
+    var cfg: [c.CONFIG_WORDS]u64 = [0; c.CONFIG_WORDS]
+    val p: *u8 = ptr_cast(&cfg[0])
+
+    c.device_config_init(ptr_cast(p), kind)
+    write(p, c.CFG_SAMPLE_RATE, sample_rate)
+    write(p, c.CFG_PERIOD_FRAMES, period_frames)
+    write(p, c.CFG_DATA_CALLBACK, &on_data)
+    write[*Device](p, c.CFG_USER_DATA, &*d)
+
+    write(p, c.CFG_PLAYBACK_FORMAT, format_code(out.format))
+    write(p, c.CFG_PLAYBACK_CHANNELS, out.channels)
+    write(p, c.CFG_CAPTURE_FORMAT, format_code(inp.format))
+    write(p, c.CFG_CAPTURE_CHANNELS, inp.channels)
+
+    // miniaudio copies a device id during `ma_device_init`, so locals that outlive the call will do.
+    var out_id: [c.ID_WORDS]u64 = [0; c.ID_WORDS]
+    var inp_id: [c.ID_WORDS]u64 = [0; c.ID_WORDS]
+
+    out.device match
+        Some(info) ->
+            out_id = info.id_words()
+            write(p, c.CFG_PLAYBACK_ID, &out_id[0])
+        None -> ()
+
+    inp.device match
+        Some(info) ->
+            inp_id = info.id_words()
+            write(p, c.CFG_CAPTURE_ID, &inp_id[0])
+        None -> ()
+
+    val r = c.device_init(ctx.raw_ptr(), ptr_cast(p), raw)
+
+    if r != c.SUCCESS then return Err(Error(r))
+
+    d.open = true
+    Ok(d)

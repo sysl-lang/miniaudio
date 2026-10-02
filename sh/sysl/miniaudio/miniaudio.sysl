@@ -1,0 +1,175 @@
+// Sound in and out of the machine, through miniaudio.
+//
+//     val ctx = context()?
+//     val phase: &sync Phase = Phase(Atomic(0))
+//
+//     val d = ctx.playback(stream(F32, 2), 48000, (f: Frames) ->
+//         val out = f.output_f32()
+//         ...fill out, two samples per frame...
+//     )?
+//
+//     d.start()?
+//
+// **Three types carry it.** A `Context` is a backend -- CoreAudio, PulseAudio, the null backend --
+// and the devices it can see. A `Device` is one open stream, or a pair of them for duplex, with the
+// format, channel count and sample rate the program asked for; miniaudio converts between that and
+// whatever the hardware runs at. `Frames` is what the data callback is handed each period: the
+// output buffer to fill, the input buffer to read, and how many frames each holds.
+//
+// **The data callback runs on miniaudio's audio thread**, which is why it is a `&sync Fn`: whatever
+// it captures has to be safe to share with the thread that made it, and the compiler checks that
+// where the closure is written. A program talks to it through an `Atomic` it captured in a
+// `&sync` box, never through an ordinary `&T`.
+
+module sh.sysl.miniaudio
+
+import sh.sysl.miniaudio.c
+import sysl.text.from_cstring
+
+/** A miniaudio failure. `code` is the negative `ma_result` it answered with. */
+struct Error
+    code: i32
+
+    /** miniaudio's sentence for the code -- "No backend", "Format not supported". */
+    message(self) -> string = from_cstring(c.result_description(self.code)).unwrap_or("Unknown error")
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_str(self.message() + " (" + str(self.code) + ")", out, fmt)
+
+/** Two errors are the same error when they are the same code. */
+impl Eq for Error
+    eq(self, rhs: Error) -> bool = self.code == rhs.code
+
+/** `ma_result` read as a `Result`: `MA_SUCCESS` is zero and every failure is below it. */
+private[miniaudio] checked(code: i32) -> Result[unit, Error] =
+    if code == c.SUCCESS then Ok(()) else Err(Error(code))
+
+/** The version of miniaudio compiled into this package, as `"0.11.25"`. */
+version() -> string = from_cstring(c.version_string()).unwrap_or("?")
+
+/** How one sample is stored.
+ *
+ * `S24` is three bytes, tightly packed, so it has no slice type of its own and is reached through
+ * `Frames.output_bytes`. `Unknown` asks the device for whatever its native format is; the format it
+ * settled on is then `Device.playback_format` or `capture_format`.
+ */
+enum Format
+    Unknown
+    U8
+    S16
+    S24
+    S32
+    F32
+
+/** A format prints as its name -- `f32`, `s16`, `unknown`. */
+impl Display for Format
+    display(self, out: *Writer, fmt: FormatSpec)
+        val name = self match
+            Unknown -> "unknown"
+            U8 -> "u8"
+            S16 -> "s16"
+            S24 -> "s24"
+            S32 -> "s32"
+            F32 -> "f32"
+
+        display_str(name, out, fmt)
+
+/** The bytes one sample of `f` takes -- `0` for `Unknown`. */
+bytes_per_sample(f: Format) -> u32 = c.bytes_per_sample(format_code(f))
+
+private[miniaudio] format_code(f: Format) -> i32 = f match
+    Unknown -> c.FORMAT_UNKNOWN
+    U8 -> c.FORMAT_U8
+    S16 -> c.FORMAT_S16
+    S24 -> c.FORMAT_S24
+    S32 -> c.FORMAT_S32
+    F32 -> c.FORMAT_F32
+
+private[miniaudio] format_of(code: i32) -> Format =
+    if code == c.FORMAT_U8 then U8
+    else if code == c.FORMAT_S16 then S16
+    else if code == c.FORMAT_S24 then S24
+    else if code == c.FORMAT_S32 then S32
+    else if code == c.FORMAT_F32 then F32
+    else Unknown
+
+/** A platform audio API miniaudio can drive.
+ *
+ * **Which ones exist depends on the platform the program was built for** -- `is_enabled` answers
+ * it. `Null` exists everywhere: it plays into nothing and records silence, at the rate it was asked
+ * for, on a real thread, which makes it what a test suite runs against.
+ */
+enum Backend
+    Wasapi
+    DSound
+    WinMM
+    CoreAudio
+    Sndio
+    Audio4
+    Oss
+    PulseAudio
+    Alsa
+    Jack
+    AAudio
+    OpenSL
+    WebAudio
+    Custom
+    Null
+
+private[miniaudio] backend_code(b: Backend) -> i32 = b match
+    Wasapi -> c.BACKEND_WASAPI
+    DSound -> c.BACKEND_DSOUND
+    WinMM -> c.BACKEND_WINMM
+    CoreAudio -> c.BACKEND_COREAUDIO
+    Sndio -> c.BACKEND_SNDIO
+    Audio4 -> c.BACKEND_AUDIO4
+    Oss -> c.BACKEND_OSS
+    PulseAudio -> c.BACKEND_PULSEAUDIO
+    Alsa -> c.BACKEND_ALSA
+    Jack -> c.BACKEND_JACK
+    AAudio -> c.BACKEND_AAUDIO
+    OpenSL -> c.BACKEND_OPENSL
+    WebAudio -> c.BACKEND_WEBAUDIO
+    Custom -> c.BACKEND_CUSTOM
+    Null -> c.BACKEND_NULL
+
+private[miniaudio] backend_of(code: i32) -> Backend =
+    if code == c.BACKEND_WASAPI then Wasapi
+    else if code == c.BACKEND_DSOUND then DSound
+    else if code == c.BACKEND_WINMM then WinMM
+    else if code == c.BACKEND_COREAUDIO then CoreAudio
+    else if code == c.BACKEND_SNDIO then Sndio
+    else if code == c.BACKEND_AUDIO4 then Audio4
+    else if code == c.BACKEND_OSS then Oss
+    else if code == c.BACKEND_PULSEAUDIO then PulseAudio
+    else if code == c.BACKEND_ALSA then Alsa
+    else if code == c.BACKEND_JACK then Jack
+    else if code == c.BACKEND_AAUDIO then AAudio
+    else if code == c.BACKEND_OPENSL then OpenSL
+    else if code == c.BACKEND_WEBAUDIO then WebAudio
+    else if code == c.BACKEND_CUSTOM then Custom
+    else Null
+
+/** A backend prints as miniaudio's name for it, the same as `backend_name`. */
+impl Display for Backend
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(backend_name(self), out, fmt)
+
+/** Whether this build of miniaudio has `b` compiled in. */
+is_enabled(b: Backend) -> bool = c.is_backend_enabled(backend_code(b)) != 0
+
+/** miniaudio's name for `b` -- `"Core Audio"`, `"PulseAudio"`, `"Null"`. */
+backend_name(b: Backend) -> string = from_cstring(c.backend_name(backend_code(b))).unwrap_or("?")
+
+// Reading and writing one field of a C struct sysl never lays out, at the offset the header gave.
+private[miniaudio] field[T](base: *u8, offset: usize) -> *T = ptr_cast(usize(base) + offset)
+
+private[miniaudio] read[T](base: *u8, offset: usize) -> T = field[T](base, offset)[0]
+
+private[miniaudio] write[T](base: *u8, offset: usize, v: T)
+    val p: *T = field(base, offset)
+    p[0] = v
+
+// A C string sitting inside a struct, read up to its terminator.
+private[miniaudio] read_name(base: *u8, offset: usize) -> string =
+    from_cstring(field[u8](base, offset)).unwrap_or("")

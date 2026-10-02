@@ -1,0 +1,154 @@
+// A backend, and the devices it can see.
+//
+//     val ctx = context()?                          // the platform's default order
+//     val quiet = context([Null])?                  // only the null backend
+//
+//     for d in ctx.playback_devices()?.view()
+//         print(d.name)
+//
+// **A context is where every device is opened from**, and a device holds its context for as long as
+// it is open, so dropping the program's reference to a context with a device still playing is safe.
+
+module sh.sysl.miniaudio
+
+import sh.sysl.miniaudio.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+
+/** A device as enumeration reports it -- the three fields every backend is required to fill.
+ *
+ * `id` is the backend's own identifier, kept opaque. It is what `stream(..., device = Some(info))`
+ * hands back to miniaudio to open this device rather than the default one, and it is only meaningful
+ * to a context on the same backend.
+ */
+struct DeviceInfo
+    name: string
+    is_default: bool
+    private id: [c.ID_WORDS]u64
+
+    /** Whether `self` and `other` name the same device, by the backend's identifier. */
+    same_device(self, other: DeviceInfo) -> bool
+        var a = self.id
+        var b = other.id
+        c.device_id_equal(ptr_cast(&a[0]), ptr_cast(&b[0])) != 0
+
+    // The identifier's bytes, for a config to point at once they sit somewhere that will not move.
+    private[miniaudio] id_words(self) -> [c.ID_WORDS]u64 = self.id
+end DeviceInfo
+
+/** A backend, opened. Reached through `&Context`; miniaudio's state is released when the last
+ * reference goes, or when the last device opened from it does.
+ */
+struct Context
+    private raw: *c.Context
+
+    /** The backend this context settled on -- the first one in its list that initialised. */
+    backend(self) -> Backend = backend_of(read(ptr_cast(self.raw), c.CTX_BACKEND))
+
+    /** The devices that can play, as the backend sees them right now. */
+    playback_devices(self) -> Result[Buf[DeviceInfo], Error]
+        var p: *c.DeviceInfo = null
+        var n: u32 = 0
+        var q: *c.DeviceInfo = null
+        var m: u32 = 0
+
+        checked(c.context_get_devices(self.raw, &p, &n, &q, &m))?
+        Ok(infos(p, n))
+
+    /** The devices that can record, as the backend sees them right now. */
+    capture_devices(self) -> Result[Buf[DeviceInfo], Error]
+        var p: *c.DeviceInfo = null
+        var n: u32 = 0
+        var q: *c.DeviceInfo = null
+        var m: u32 = 0
+
+        checked(c.context_get_devices(self.raw, &p, &n, &q, &m))?
+        Ok(infos(q, m))
+
+    /** Open a device that plays `out` at `sample_rate`, calling `cb` on the audio thread for every
+     * period it needs filled. It is opened stopped; `start` begins the callbacks.
+     *
+     * `period_frames` of `0` lets the backend choose. A `sample_rate` of `0` asks for the device's
+     * own rate, which `Device.sample_rate` then reports.
+     */
+    @crossing(cb)
+    playback(&self, out: Stream, sample_rate: u32, cb: &sync Fn(Frames) -> unit,
+             period_frames: u32 = 0) -> Result[&Device, Error] =
+        open_device(self, c.TYPE_PLAYBACK, out, stream(Unknown, 0), sample_rate, period_frames, cb)
+
+    /** Open a device that records `inp` at `sample_rate`, handing `cb` each period as it arrives. */
+    @crossing(cb)
+    capture(&self, inp: Stream, sample_rate: u32, cb: &sync Fn(Frames) -> unit,
+            period_frames: u32 = 0) -> Result[&Device, Error] =
+        open_device(self, c.TYPE_CAPTURE, stream(Unknown, 0), inp, sample_rate, period_frames, cb)
+
+    /** Open a device that records `inp` and plays `out` in step: every callback carries one period
+     * of input and asks for the same number of frames of output.
+     */
+    @crossing(cb)
+    duplex(&self, out: Stream, inp: Stream, sample_rate: u32, cb: &sync Fn(Frames) -> unit,
+           period_frames: u32 = 0) -> Result[&Device, Error] =
+        open_device(self, c.TYPE_DUPLEX, out, inp, sample_rate, period_frames, cb)
+
+    private[miniaudio] raw_ptr(self) -> *c.Context = self.raw
+end Context
+
+impl Drop for Context
+    drop(self)
+        c.context_uninit(self.raw)
+        c.free(ptr_cast(self.raw), null)
+
+/** A context over `backends`, tried in order, or over miniaudio's default order for the platform
+ * when the list is empty. `Err` is `NO_BACKEND` when none of them initialised.
+ */
+context(backends: []const Backend = []) -> Result[&Context, Error]
+    val raw: *c.Context = ptr_cast(c.calloc(c.CONTEXT_SIZE, null))
+
+    if raw == null then return Err(Error(c.OUT_OF_MEMORY))
+
+    var codes: Buf[i32] = buf()
+
+    for b in backends
+        codes.push(backend_code(b))
+
+    val list: *i32 = if codes.is_empty() then null else as_ptr(codes.view())
+    val r = c.context_init(list, u32(codes.len()), null, raw)
+
+    if r != c.SUCCESS
+        c.free(ptr_cast(raw), null)
+        return Err(Error(r))
+
+    Ok(Context(raw))
+
+/** One side of a device: the sample format and channel count the program reads or writes, and
+ * which device to open. `None` is the backend's default device.
+ *
+ * `Unknown` and `0` ask for whatever the device runs at natively; the device then reports what it
+ * chose.
+ */
+struct Stream
+    format: Format
+    channels: u32
+    device: Option[DeviceInfo]
+
+/** `Stream(format, channels, device)`, with the defaults most programs want. */
+stream(format: Format = F32, channels: u32 = 2, device: Option[DeviceInfo] = None) -> Stream =
+    Stream(format, channels, device)
+
+// The context's array of `ma_device_info`, copied out field by field.
+private infos(p: *c.DeviceInfo, n: u32) -> Buf[DeviceInfo]
+    var out: Buf[DeviceInfo] = buf()
+
+    for i in 0..<usize(n)
+        val base: *u8 = ptr_cast(usize(p) + i * c.INFO_SIZE)
+        var info = DeviceInfo(read_name(base, c.INFO_NAME), read[u32](base, c.INFO_IS_DEFAULT) != 0,
+                              [0; c.ID_WORDS])
+        val src = field[u8](base, c.INFO_ID)
+        val dst: *u8 = ptr_cast(&info.id[0])
+
+        for j in 0..<c.ID_SIZE
+            dst[j] = src[j]
+
+        out.push(info)
+
+    out

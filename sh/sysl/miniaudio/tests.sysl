@@ -1,0 +1,325 @@
+module sh.sysl.miniaudio
+@tests
+
+import sysl.sync.Atomic
+import sysl.posix.time.sleep
+import sysl.time.millis
+
+// Every device here is opened on miniaudio's null backend, which runs a real audio thread at the
+// requested rate and plays into nothing -- so the callbacks really fire on another thread, the
+// frames really advance with the clock, and none of it needs a sound card.
+//
+// **What each callback asserts it records rather than asserts.** A failing `assert` on the audio
+// thread would end the process from a thread the runner is not watching, so the closures count what
+// they saw into `&sync` atomics and the test thread asserts the counts afterwards.
+
+struct Tally
+    calls: Atomic[u64]
+    frames: Atomic[u64]
+    wrong: Atomic[u64]
+    loud: Atomic[u64]
+
+tally() -> &sync Tally = Tally(Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+
+// -- The library -----------------------------------------------------------------------------------
+
+@test("the vendored miniaudio is 0.11.25")
+vendored_version()
+    assert_eq(version(), "0.11.25")
+
+@test("the null backend is compiled in everywhere")
+null_backend_enabled()
+    assert(is_enabled(Null))
+    assert(!is_enabled(WebAudio))
+    assert_eq(backend_name(Null), "Null")
+    assert_eq(backend_name(CoreAudio), "Core Audio")
+
+@test("each format's sample width")
+sample_widths()
+    assert_eq(bytes_per_sample(U8), 1)
+    assert_eq(bytes_per_sample(S16), 2)
+    assert_eq(bytes_per_sample(S24), 3)
+    assert_eq(bytes_per_sample(S32), 4)
+    assert_eq(bytes_per_sample(F32), 4)
+    assert_eq(bytes_per_sample(Unknown), 0)
+
+// -- The context -----------------------------------------------------------------------------------
+
+@test("a context over the null backend settles on it")
+null_context()
+    assert_eq(context([Null]).unwrap().backend(), Null)
+
+@test("a context over only backends this platform lacks is NO_BACKEND")
+no_backend()
+    context([WebAudio]) match
+        Ok(_) -> assert(false)
+        Err(e) ->
+            assert_eq(e.code, -203)
+            assert_eq(str(e), "No backend (-203)")
+
+@test("the default context finds some backend")
+default_context()
+    assert(context().is_ok())
+
+@test("the null backend enumerates one device each way, both default")
+null_enumeration()
+    val ctx = context([Null]).unwrap()
+    val out = ctx.playback_devices().unwrap()
+    val inp = ctx.capture_devices().unwrap()
+
+    assert_eq(out.len(), 1)
+    assert_eq(inp.len(), 1)
+    assert_eq(out[0].name, "NULL Playback Device")
+    assert_eq(inp[0].name, "NULL Capture Device")
+    assert(out[0].is_default)
+    assert(out[0].same_device(out[0]))
+
+// -- Playback --------------------------------------------------------------------------------------
+
+// The fixed-size callback is miniaudio's default, so every call carries exactly the period asked
+// for; the buffer holds a sample per channel per frame; and it arrives silent.
+@test("playback hands the callback the period, channel count and format asked for")
+playback_shape()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    val d = ctx.playback(stream(F32, 2), 48000, period_frames = 480, cb = (f: Frames) ->
+        val out = f.output_f32()
+
+        t.calls.add(1)
+        t.frames.add(u64(f.count))
+
+        if f.count != 480 || out.len != 960 || f.output_channels != 2 then t.wrong.add(1)
+
+        for s in out
+            if s != 0.0 then t.loud.add(1)
+
+        for i in 0..<out.len
+            out[i] = 0.25).unwrap()
+
+    assert_eq(d.sample_rate(), 48000)
+    assert_eq(d.playback_format(), F32)
+    assert_eq(d.playback_channels(), 2)
+    assert_eq(d.playback_hardware().name, "NULL Playback Device")
+    assert_eq(d.state(), Stopped)
+
+    d.start().unwrap()
+    assert_eq(d.state(), Started)
+    sleep(millis(100))
+    d.stop().unwrap()
+
+    assert(t.calls.load() > 1)
+    assert_eq(t.wrong.load(), 0)
+    assert_eq(t.loud.load(), 0)
+    assert_eq(t.frames.load(), t.calls.load() * 480)
+
+// The null backend paces itself by the clock at the device's rate, so the frames consumed over a
+// stretch of time say which rate arrived. 8000 is far enough from every default that a rate which
+// failed to reach the config is six times out.
+@test("playback consumes frames at the requested rate")
+playback_rate()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    val d = ctx.playback(stream(S16, 1), 8000, period_frames = 80, cb = (f: Frames) ->
+        if f.output_s16().len != usize(f.count) then t.wrong.add(1)
+
+        t.frames.add(u64(f.count))).unwrap()
+
+    assert_eq(d.sample_rate(), 8000)
+    assert_eq(d.playback_format(), S16)
+    assert_eq(d.playback_channels(), 1)
+
+    d.start().unwrap()
+    sleep(millis(250))
+    d.stop().unwrap()
+
+    val n = t.frames.load()
+
+    assert_eq(t.wrong.load(), 0)
+    assert(n >= 1000)
+    assert(n <= 4000)
+
+@test("an S24 device is reached through its bytes, three to a sample")
+packed_24_bit()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    val d = ctx.playback(stream(S24, 2), 44100, period_frames = 100, cb = (f: Frames) ->
+        t.calls.add(1)
+
+        if f.output_bytes().len != usize(f.count) * 6 then t.wrong.add(1)).unwrap()
+
+    d.start().unwrap()
+    sleep(millis(50))
+    d.stop().unwrap()
+
+    assert(t.calls.load() > 0)
+    assert_eq(t.wrong.load(), 0)
+
+@test("an unknown format and zero channels take the device's own")
+native_format()
+    val d = context([Null]).unwrap().playback(stream(Unknown, 0), 0, (f: Frames) -> ()).unwrap()
+
+    assert(d.playback_format() != Unknown)
+    assert(d.playback_channels() > 0)
+    assert(d.sample_rate() > 0)
+
+@test("a device chosen from the enumeration is the one opened")
+chosen_device()
+    val ctx = context([Null]).unwrap()
+    val info = ctx.playback_devices().unwrap()[0]
+    val d = ctx.playback(stream(F32, 2, Some(info)), 48000, (f: Frames) -> ()).unwrap()
+
+    assert_eq(d.playback_hardware().name, info.name)
+
+// -- Capture and duplex ----------------------------------------------------------------------------
+
+@test("capture hands the callback a silent input buffer of the shape asked for")
+capture_shape()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    val d = ctx.capture(stream(S32, 3), 16000, period_frames = 160, cb = (f: Frames) ->
+        val inp = f.input_s32()
+
+        t.calls.add(1)
+
+        if f.count != 160 || inp.len != 480 || f.input_format != S32 then t.wrong.add(1)
+
+        for s in inp
+            if s != 0 then t.loud.add(1)).unwrap()
+
+    assert_eq(d.capture_format(), S32)
+    assert_eq(d.capture_channels(), 3)
+    assert_eq(d.capture_hardware().name, "NULL Capture Device")
+
+    d.start().unwrap()
+    sleep(millis(100))
+    d.stop().unwrap()
+
+    assert(t.calls.load() > 0)
+    assert_eq(t.wrong.load(), 0)
+    assert_eq(t.loud.load(), 0)
+
+@test("duplex hands the callback both buffers, each in its own format")
+duplex_shape()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    val d = ctx.duplex(stream(F32, 2), stream(S16, 1), 48000, period_frames = 256, cb = (f: Frames) ->
+        val out = f.output_f32()
+        val inp = f.input_s16()
+
+        t.calls.add(1)
+
+        if out.len != usize(f.count) * 2 || inp.len != usize(f.count) then t.wrong.add(1)
+
+        for i in 0..<inp.len
+            out[2 * i] = f32(inp[i])).unwrap()
+
+    assert_eq(d.playback_format(), F32)
+    assert_eq(d.capture_format(), S16)
+
+    d.start().unwrap()
+    sleep(millis(100))
+    d.stop().unwrap()
+
+    assert(t.calls.load() > 0)
+    assert_eq(t.wrong.load(), 0)
+
+// -- Lifetime --------------------------------------------------------------------------------------
+
+@test("a stopped device is not called back, and a restarted one is again")
+stop_halts()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+    val d = ctx.playback(stream(F32, 1), 48000, (f: Frames) -> t.calls.add(1)).unwrap()
+
+    d.start().unwrap()
+    d.start().unwrap()
+    sleep(millis(50))
+    d.stop().unwrap()
+
+    val stopped = t.calls.load()
+
+    assert(stopped > 0)
+    assert(!d.is_started())
+    sleep(millis(50))
+    assert_eq(t.calls.load(), stopped)
+
+    d.start().unwrap()
+    sleep(millis(50))
+    d.stop().unwrap()
+    assert(t.calls.load() > stopped)
+
+@test("a closed device is uninitialized, and refuses to start")
+close_releases()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+    val d = ctx.playback(stream(F32, 1), 48000, (f: Frames) -> t.calls.add(1)).unwrap()
+
+    d.start().unwrap()
+    sleep(millis(30))
+    d.close()
+
+    val closed = t.calls.load()
+
+    assert_eq(d.state(), Uninitialized)
+    assert_eq(d.start().unwrap_err(), Error(-300))
+    assert_eq(d.stop().unwrap_err(), Error(-300))
+    d.close()
+    sleep(millis(30))
+    assert_eq(t.calls.load(), closed)
+
+// Starts a device and lets go of it, so the destructor is what has to stop the audio thread.
+start_and_forget(ctx: &Context, t: &sync Tally)
+    val d = ctx.playback(stream(F32, 1), 48000, (f: Frames) -> t.calls.add(1)).unwrap()
+
+    d.start().unwrap()
+    sleep(millis(30))
+
+@test("dropping the last reference to a started device stops it")
+drop_stops()
+    val ctx = context([Null]).unwrap()
+    val t = tally()
+
+    start_and_forget(ctx, t)
+
+    val dropped = t.calls.load()
+
+    assert(dropped > 0)
+    sleep(millis(50))
+    assert_eq(t.calls.load(), dropped)
+
+// The program keeps only the device; the context it came from has to stay open underneath it.
+open_alone(t: &sync Tally) -> &Device =
+    context([Null]).unwrap().playback(stream(F32, 1), 48000, (f: Frames) -> t.calls.add(1)).unwrap()
+
+@test("a device keeps its context alive")
+device_holds_context()
+    val t = tally()
+    val d = open_alone(t)
+
+    assert_eq(d.context().backend(), Null)
+    d.start().unwrap()
+    sleep(millis(30))
+    d.stop().unwrap()
+    assert(t.calls.load() > 0)
+
+// -- Settings and failures -------------------------------------------------------------------------
+
+@test("the master volume reads back, and a negative one is refused")
+master_volume()
+    val d = context([Null]).unwrap().playback(stream(F32, 2), 48000, (f: Frames) -> ()).unwrap()
+
+    assert_eq(d.volume().unwrap(), 1.0)
+    d.set_volume(0.5).unwrap()
+    assert_eq(d.volume().unwrap(), 0.5)
+    assert_eq(d.set_volume(-1.0).unwrap_err(), Error(-2))
+
+@test("more channels than miniaudio carries is refused at open")
+too_many_channels()
+    val r = context([Null]).unwrap().playback(stream(F32, 255), 48000, (f: Frames) -> ())
+
+    assert_eq(r.unwrap_err(), Error(-2))
