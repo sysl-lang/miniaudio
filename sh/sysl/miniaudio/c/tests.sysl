@@ -1,0 +1,102 @@
+module sh.sysl.miniaudio.c
+@tests
+
+import sysl.slices.is_aligned
+
+// The raw layer is a set of numbers read out of the header, and these hold each one against what a C
+// program compiled with the same build options printed. A disagreement means sysl and clang see
+// miniaudio differently -- or that a `defines` entry stopped reaching one of the two files -- and
+// every offset the pleasant layer writes through would then land in the wrong field.
+
+@test("the structs are the sizes C measured")
+struct_sizes()
+    assert_eq(CONTEXT_SIZE, 688)
+    assert_eq(DEVICE_SIZE, 3944)
+    assert_eq(CONFIG_SIZE, 296)
+    assert_eq(INFO_SIZE, 1544)
+    assert_eq(ID_SIZE, 256)
+    assert_eq(CONFIG_WORDS, 37)
+    assert_eq(ID_WORDS, 32)
+    assert_eq(NAME_CAP, 256)
+
+// A config and a device id live in arrays of `u64` on the sysl side, which is only right while
+// neither wants more than eight-byte alignment.
+@test("nothing wants more than eight-byte alignment")
+alignments()
+    assert_eq(CONTEXT_ALIGN, 8)
+    assert_eq(DEVICE_ALIGN, 8)
+    assert_eq(CONFIG_ALIGN, 8)
+    assert_eq(ID_ALIGN, 8)
+
+@test("the config fields are where C put them")
+config_offsets()
+    assert_eq(CFG_SAMPLE_RATE, 4)
+    assert_eq(CFG_PERIOD_FRAMES, 8)
+    assert_eq(CFG_DATA_CALLBACK, 32)
+    assert_eq(CFG_USER_DATA, 56)
+    assert_eq(CFG_PLAYBACK_ID, 112)
+    assert_eq(CFG_PLAYBACK_FORMAT, 120)
+    assert_eq(CFG_PLAYBACK_CHANNELS, 124)
+    assert_eq(CFG_CAPTURE_FORMAT, 160)
+
+@test("the device and context fields are where C put them")
+device_offsets()
+    assert_eq(DEV_USER_DATA, 48)
+    assert_eq(DEV_SAMPLE_RATE, 12)
+    assert_eq(DEV_PLAYBACK_FORMAT, 1212)
+    assert_eq(DEV_CAPTURE_FORMAT, 2644)
+    assert_eq(INFO_NAME, 256)
+    assert_eq(INFO_IS_DEFAULT, 512)
+    assert_eq(CTX_BACKEND, 104)
+
+// Enumerations that are not an index from zero are the kind that should never be transcribed --
+// duplex is the bitwise union of the other two, and the null backend is last by design.
+@test("the enumerations cross")
+enumerations()
+    assert_eq(FORMAT_UNKNOWN, 0)
+    assert_eq(FORMAT_F32, 5)
+    assert_eq(TYPE_DUPLEX, TYPE_PLAYBACK | TYPE_CAPTURE)
+    assert_eq(BACKEND_WASAPI, 0)
+    assert_eq(BACKEND_NULL, 14)
+    assert_eq(SUCCESS, 0)
+    assert_eq(INVALID_ARGS, -2)
+    assert_eq(NO_BACKEND, -203)
+    assert_eq(DEVICE_NOT_INITIALIZED, -300)
+
+// The shim's one job: `ma_device_config_init`'s answer lands in caller storage. The device type is
+// the struct's first field, and the default resampler is what makes the rest of the struct non-zero.
+@test("the shim fills a config in caller storage")
+shim_fills_config()
+    var cfg: [CONFIG_WORDS]u64 = [0; CONFIG_WORDS]
+
+    device_config_init(ptr_cast(&cfg[0]), TYPE_DUPLEX)
+
+    val kind: *i32 = ptr_cast(&cfg[0])
+    assert_eq(kind[0], TYPE_DUPLEX)
+
+    var nonzero = 0
+
+    for w in cfg
+        if w != 0 then nonzero += 1
+
+    assert(nonzero > 1)
+
+// The device and context storage comes from miniaudio's allocator rather than from a sysl array, so
+// the address it hands back is what has to meet the alignment.
+@test("miniaudio's allocator answers aligned, zeroed storage")
+allocator_alignment()
+    val p = calloc(DEVICE_SIZE, null)
+
+    assert(p != null)
+    assert(is_aligned(p, DEVICE_ALIGN))
+    assert_eq(p[0], 0)
+    assert_eq(p[DEVICE_SIZE - 1], 0)
+    free(p, null)
+
+@test("a backend name and a result description are C strings")
+strings()
+    val n = backend_name(BACKEND_NULL)
+
+    assert_eq(n[0], u8('N'))
+    assert_eq(n[4], 0)
+    assert(result_description(NO_BACKEND) != null)

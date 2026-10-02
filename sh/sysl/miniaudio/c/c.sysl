@@ -1,0 +1,194 @@
+// miniaudio as C declares it: the context and device surface, the one shim function, and the
+// numbers and field offsets its header holds.
+//
+// **Everything that is C lives in this directory** -- `miniaudio.c` and `miniaudio.h` exactly as they
+// come in the 0.11.25 release, `shim.c` for the one return-by-value sysl has no spelling for, and
+// this file of declarations over them. Nothing here is meant to be called by a program: a context
+// and a device are storage miniaudio fills in, a failure is a negative `ma_result`, and a callback
+// is one word of code with a `void *` beside it. The module above turns those into `Context`,
+// `Device` and a `Result`.
+//
+// **The large structs are never laid out.** `ma_context`, `ma_device` and `ma_device_config` hold a
+// union per backend, mutexes, a resampler with a vtable in it, and arrays sized by `MA_MAX_CHANNELS`.
+// The binding names each as an `opaque struct`, asks the header for its size, and reads or writes
+// the dozen fields it cares about at the `offsetof` the header answers -- so nothing here restates a
+// layout that a different platform or a later miniaudio could move.
+
+module sh.sysl.miniaudio.c
+
+@include("miniaudio.h")
+@include("shim.h")
+
+opaque struct Context
+opaque struct Device
+opaque struct DeviceConfig
+opaque struct DeviceInfo
+opaque struct DeviceId
+
+// ## The library
+
+extern "ma_version_string" version_string() -> *u8
+extern "ma_result_description" result_description(r: i32) -> *u8
+extern "ma_get_backend_name" backend_name(b: i32) -> *u8
+extern "ma_is_backend_enabled" is_backend_enabled(b: i32) -> u32
+extern "ma_get_bytes_per_sample" bytes_per_sample(format: i32) -> u32
+
+// miniaudio's own allocator, which is the C library's `malloc` unless the build says otherwise. A
+// context and a device live in storage from here rather than inline in a sysl struct, because
+// neither may move once initialised and a destructor is handed a copy of the struct it runs for.
+extern "ma_calloc" calloc(size: usize, callbacks: *u8) -> *u8
+extern "ma_free" free(p: *u8, callbacks: *u8)
+
+// ## The context
+
+// `backends` may be null with a count of 0, which is miniaudio's default priority order; the config
+// may be null for every default.
+extern "ma_context_init" context_init(backends: *i32, count: u32, config: *u8, ctx: *Context) -> i32
+extern "ma_context_uninit" context_uninit(ctx: *Context) -> i32
+extern "ma_context_is_loopback_supported" context_is_loopback_supported(ctx: *Context) -> u32
+
+// Both arrays are the context's own and stay valid until the next enumeration on it.
+extern "ma_context_get_devices" context_get_devices(ctx: *Context, playback: **DeviceInfo,
+                                                    playback_count: *u32, capture: **DeviceInfo,
+                                                    capture_count: *u32) -> i32
+
+extern "ma_device_id_equal" device_id_equal(a: *DeviceId, b: *DeviceId) -> u32
+
+// ## The device
+
+// `*out = ma_device_config_init(device_type)`, through the shim.
+extern "sysl_ma_device_config_init" device_config_init(out: *DeviceConfig, device_type: i32)
+
+extern "ma_device_init" device_init(ctx: *Context, config: *DeviceConfig, dev: *Device) -> i32
+extern "ma_device_uninit" device_uninit(dev: *Device)
+extern "ma_device_start" device_start(dev: *Device) -> i32
+extern "ma_device_stop" device_stop(dev: *Device) -> i32
+extern "ma_device_is_started" device_is_started(dev: *Device) -> u32
+extern "ma_device_get_state" device_get_state(dev: *Device) -> i32
+extern "ma_device_set_master_volume" device_set_master_volume(dev: *Device, volume: f32) -> i32
+extern "ma_device_get_master_volume" device_get_master_volume(dev: *Device, volume: *f32) -> i32
+
+// ## Sizes and alignments
+//
+// What `calloc` above is asked for, and what the tests hold the allocator's answer against.
+c const
+    CONTEXT_SIZE:  usize = "sizeof(ma_context)"
+    CONTEXT_ALIGN: usize = "_Alignof(ma_context)"
+    DEVICE_SIZE:   usize = "sizeof(ma_device)"
+    DEVICE_ALIGN:  usize = "_Alignof(ma_device)"
+    CONFIG_SIZE:   usize = "sizeof(ma_device_config)"
+    CONFIG_ALIGN:  usize = "_Alignof(ma_device_config)"
+    CONFIG_WORDS:  usize = "(sizeof(ma_device_config) + 7) / 8"
+    INFO_SIZE:     usize = "sizeof(ma_device_info)"
+    ID_SIZE:       usize = "sizeof(ma_device_id)"
+    ID_ALIGN:      usize = "_Alignof(ma_device_id)"
+    ID_WORDS:      usize = "(sizeof(ma_device_id) + 7) / 8"
+    NAME_CAP:      usize = "MA_MAX_DEVICE_NAME_LENGTH + 1"
+
+// ## Where the fields are
+//
+// `ma_device_config`: what the binding writes before `ma_device_init`.
+c const
+    CFG_SAMPLE_RATE:      usize = "offsetof(ma_device_config, sampleRate)"
+    CFG_PERIOD_FRAMES:    usize = "offsetof(ma_device_config, periodSizeInFrames)"
+    CFG_PERIOD_MS:        usize = "offsetof(ma_device_config, periodSizeInMilliseconds)"
+    CFG_PERIODS:          usize = "offsetof(ma_device_config, periods)"
+    CFG_DATA_CALLBACK:    usize = "offsetof(ma_device_config, dataCallback)"
+    CFG_USER_DATA:        usize = "offsetof(ma_device_config, pUserData)"
+    CFG_PLAYBACK_ID:      usize = "offsetof(ma_device_config, playback.pDeviceID)"
+    CFG_PLAYBACK_FORMAT:  usize = "offsetof(ma_device_config, playback.format)"
+    CFG_PLAYBACK_CHANNELS: usize = "offsetof(ma_device_config, playback.channels)"
+    CFG_CAPTURE_ID:       usize = "offsetof(ma_device_config, capture.pDeviceID)"
+    CFG_CAPTURE_FORMAT:   usize = "offsetof(ma_device_config, capture.format)"
+    CFG_CAPTURE_CHANNELS: usize = "offsetof(ma_device_config, capture.channels)"
+
+// `ma_device`: what the binding reads after `ma_device_init` -- the format the program is handed
+// (`format`, `channels`), what the backend actually opened (`internal*`), and the user-data slot the
+// data callback finds its way home through.
+c const
+    DEV_USER_DATA:   usize = "offsetof(ma_device, pUserData)"
+    DEV_TYPE:        usize = "offsetof(ma_device, type)"
+    DEV_SAMPLE_RATE: usize = "offsetof(ma_device, sampleRate)"
+
+    DEV_PLAYBACK_NAME:              usize = "offsetof(ma_device, playback.name)"
+    DEV_PLAYBACK_FORMAT:            usize = "offsetof(ma_device, playback.format)"
+    DEV_PLAYBACK_CHANNELS:          usize = "offsetof(ma_device, playback.channels)"
+    DEV_PLAYBACK_INTERNAL_FORMAT:   usize = "offsetof(ma_device, playback.internalFormat)"
+    DEV_PLAYBACK_INTERNAL_CHANNELS: usize = "offsetof(ma_device, playback.internalChannels)"
+    DEV_PLAYBACK_INTERNAL_RATE:     usize = "offsetof(ma_device, playback.internalSampleRate)"
+    DEV_PLAYBACK_INTERNAL_PERIOD:   usize = "offsetof(ma_device, playback.internalPeriodSizeInFrames)"
+    DEV_PLAYBACK_INTERNAL_PERIODS:  usize = "offsetof(ma_device, playback.internalPeriods)"
+
+    DEV_CAPTURE_NAME:              usize = "offsetof(ma_device, capture.name)"
+    DEV_CAPTURE_FORMAT:            usize = "offsetof(ma_device, capture.format)"
+    DEV_CAPTURE_CHANNELS:          usize = "offsetof(ma_device, capture.channels)"
+    DEV_CAPTURE_INTERNAL_FORMAT:   usize = "offsetof(ma_device, capture.internalFormat)"
+    DEV_CAPTURE_INTERNAL_CHANNELS: usize = "offsetof(ma_device, capture.internalChannels)"
+    DEV_CAPTURE_INTERNAL_RATE:     usize = "offsetof(ma_device, capture.internalSampleRate)"
+    DEV_CAPTURE_INTERNAL_PERIOD:   usize = "offsetof(ma_device, capture.internalPeriodSizeInFrames)"
+    DEV_CAPTURE_INTERNAL_PERIODS:  usize = "offsetof(ma_device, capture.internalPeriods)"
+
+// `ma_context` and `ma_device_info`: the backend a context settled on, and the three fields
+// enumeration is guaranteed to fill.
+c const
+    CTX_BACKEND:     usize = "offsetof(ma_context, backend)"
+    INFO_ID:         usize = "offsetof(ma_device_info, id)"
+    INFO_NAME:       usize = "offsetof(ma_device_info, name)"
+    INFO_IS_DEFAULT: usize = "offsetof(ma_device_info, isDefault)"
+
+// ## The numbers
+
+c const
+    SUCCESS:                i32 = "MA_SUCCESS"
+    ERROR:                  i32 = "MA_ERROR"
+    INVALID_ARGS:           i32 = "MA_INVALID_ARGS"
+    INVALID_OPERATION:      i32 = "MA_INVALID_OPERATION"
+    OUT_OF_MEMORY:          i32 = "MA_OUT_OF_MEMORY"
+    FORMAT_NOT_SUPPORTED:   i32 = "MA_FORMAT_NOT_SUPPORTED"
+    DEVICE_TYPE_NOT_SUPPORTED: i32 = "MA_DEVICE_TYPE_NOT_SUPPORTED"
+    NO_BACKEND:             i32 = "MA_NO_BACKEND"
+    NO_DEVICE:              i32 = "MA_NO_DEVICE"
+    INVALID_DEVICE_CONFIG:  i32 = "MA_INVALID_DEVICE_CONFIG"
+    BACKEND_NOT_ENABLED:    i32 = "MA_BACKEND_NOT_ENABLED"
+    DEVICE_NOT_INITIALIZED: i32 = "MA_DEVICE_NOT_INITIALIZED"
+    DEVICE_NOT_STARTED:     i32 = "MA_DEVICE_NOT_STARTED"
+    FAILED_TO_INIT_BACKEND: i32 = "MA_FAILED_TO_INIT_BACKEND"
+    FAILED_TO_OPEN_BACKEND_DEVICE:  i32 = "MA_FAILED_TO_OPEN_BACKEND_DEVICE"
+    FAILED_TO_START_BACKEND_DEVICE: i32 = "MA_FAILED_TO_START_BACKEND_DEVICE"
+
+c const
+    FORMAT_UNKNOWN: i32 = "ma_format_unknown"
+    FORMAT_U8:      i32 = "ma_format_u8"
+    FORMAT_S16:     i32 = "ma_format_s16"
+    FORMAT_S24:     i32 = "ma_format_s24"
+    FORMAT_S32:     i32 = "ma_format_s32"
+    FORMAT_F32:     i32 = "ma_format_f32"
+
+c const
+    TYPE_PLAYBACK: i32 = "ma_device_type_playback"
+    TYPE_CAPTURE:  i32 = "ma_device_type_capture"
+    TYPE_DUPLEX:   i32 = "ma_device_type_duplex"
+
+c const
+    STATE_UNINITIALIZED: i32 = "ma_device_state_uninitialized"
+    STATE_STOPPED:       i32 = "ma_device_state_stopped"
+    STATE_STARTED:       i32 = "ma_device_state_started"
+    STATE_STARTING:      i32 = "ma_device_state_starting"
+    STATE_STOPPING:      i32 = "ma_device_state_stopping"
+
+c const
+    BACKEND_WASAPI:     i32 = "ma_backend_wasapi"
+    BACKEND_DSOUND:     i32 = "ma_backend_dsound"
+    BACKEND_WINMM:      i32 = "ma_backend_winmm"
+    BACKEND_COREAUDIO:  i32 = "ma_backend_coreaudio"
+    BACKEND_SNDIO:      i32 = "ma_backend_sndio"
+    BACKEND_AUDIO4:     i32 = "ma_backend_audio4"
+    BACKEND_OSS:        i32 = "ma_backend_oss"
+    BACKEND_PULSEAUDIO: i32 = "ma_backend_pulseaudio"
+    BACKEND_ALSA:       i32 = "ma_backend_alsa"
+    BACKEND_JACK:       i32 = "ma_backend_jack"
+    BACKEND_AAUDIO:     i32 = "ma_backend_aaudio"
+    BACKEND_OPENSL:     i32 = "ma_backend_opensl"
+    BACKEND_WEBAUDIO:   i32 = "ma_backend_webaudio"
+    BACKEND_CUSTOM:     i32 = "ma_backend_custom"
+    BACKEND_NULL:       i32 = "ma_backend_null"

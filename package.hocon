@@ -1,0 +1,68 @@
+// Audio playback and capture, bound to miniaudio.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **miniaudio is vendored, and here that is a claim about where it runs rather than a way to skip an
+// install step.** miniaudio links no audio library: it `dlopen`s whichever backend the machine turns
+// out to have -- PipeWire, PulseAudio or ALSA on Linux, CoreAudio on macOS, WASAPI on Windows, AAudio
+// or OpenSL ES on Android -- and falls through its list to the next one. So one build of this package
+// plays sound on a machine with nothing audio-related installed, including an Android phone, where
+// no package manager could have supplied it. Homebrew does carry `miniaudio` and Debian has it from
+// trixie, but a `pkg_config` requirement would buy a link line that every one of those platforms is
+// better off without.
+//
+// **It is not a claim that it runs on a board.** The vendored C needs threads and a clock: at
+// `--target thumbv7m-none-eabi` it stops at `pthread.h`, and against newlib at `nanosleep` and
+// `pthread_attr_init`. The README's "Where it runs" has both commands.
+
+package {
+  name    = "miniaudio"
+  version = "0.1.0"
+
+  // The compiler this was written and tested against. The newest thing it leans on is the capture
+  // check on a `&sync Fn` -- the data callback runs on miniaudio's own thread, and a closure that
+  // captured an ordinary `&T` is refused where it is written rather than racing at run time.
+  sysl = "0.0.155"
+}
+
+// **`posix`, because miniaudio is a hosted library.** It starts an audio thread for every device,
+// waits on condition variables, and opens system libraries at run time; there is no freestanding
+// target this works on, and saying so turns that into one refusal rather than a link error.
+//
+// **`heap`, because every context and device is a `&T`** -- and the C state behind each comes from
+// miniaudio's allocator, so that a destructor can hand it back.
+//
+// `posix` implies `os`, so that one is not written out.
+requires {
+  heap  = true
+  posix = true
+}
+
+// What miniaudio's own C is compiled with.
+//
+// **Each one removes a subsystem this package does not bind** -- the decoders and encoders, the
+// waveform and noise generators, the node graph, the high-level engine and the resource manager that
+// streams files into it. They cost compile time and binary size and would otherwise be linked into
+// every consumer. The braced key gives the implementation and the shim **one** copy of the list, and
+// a `c const` block inherits the macros of the carried C in its own directory, so the sizes and
+// offsets `c.sysl` reads are the ones the objects were compiled with.
+//
+// None of them changes `ma_context`, `ma_device` or `ma_device_config`; the device surface is the
+// same with or without them.
+defines {
+  "sh/sysl/miniaudio/c/{miniaudio,shim}.c" {
+    MA_NO_DECODING         = true
+    MA_NO_ENCODING         = true
+    MA_NO_GENERATION       = true
+    MA_NO_NODE_GRAPH       = true
+    MA_NO_ENGINE           = true
+    MA_NO_RESOURCE_MANAGER = true
+  }
+}
