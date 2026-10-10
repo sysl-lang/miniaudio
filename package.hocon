@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.0" }
+//       miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.0` on this repository.
+// tag `v0.1.1` on this repository.
 //
 // **miniaudio is vendored, and here that is a claim about where it runs rather than a way to skip an
 // install step.** miniaudio links no audio library: it `dlopen`s whichever backend the machine turns
@@ -24,12 +24,13 @@
 
 package {
   name    = "miniaudio"
-  version = "0.1.0"
+  version = "0.1.1"
 
-  // The compiler this was written and tested against. The newest thing it leans on is the capture
-  // check on a `&sync Fn` -- the data callback runs on miniaudio's own thread, and a closure that
-  // captured an ordinary `&T` is refused where it is written rather than racing at run time.
-  sysl = "0.0.155"
+  // The compiler this was written and tested against. It leans on the capture check on a `&sync
+  // Fn` -- the data callback runs on miniaudio's own thread, and a closure that captured an ordinary
+  // `&T` is refused where it is written rather than racing at run time -- and on a `val`-bound
+  // slice being writable through.
+  sysl = "0.1.0-alpha.8"
 }
 
 // **`posix`, because miniaudio is a hosted library.** It starts an audio thread for every device,

@@ -5,7 +5,7 @@ Audio playback and capture for sysl, bound to [miniaudio](https://miniaud.io) 0.
 
 ```hocon
 dependencies {
-  miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.0" }
+  miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.1" }
 }
 ```
 

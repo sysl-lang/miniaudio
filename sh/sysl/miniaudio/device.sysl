@@ -212,7 +212,7 @@ end Frames
 private view[T](p: *u8, wanted: Format, actual: Format, n: u32) -> []T
     checked_view(p, wanted, actual)
 
-    var q: *T = ptr_cast(p)
+    val q: *T = ptr_cast(p)
     q[0..<usize(n)]
 
 private read_view[T](p: *u8, wanted: Format, actual: Format, n: u32) -> []const T
@@ -242,7 +242,7 @@ private[miniaudio] open_device(ctx: &Context, kind: i32, out: Stream, inp: Strea
 
     if raw == null then return Err(Error(c.OUT_OF_MEMORY))
 
-    var d: &Device = Device(raw, false, ctx, cb)
+    val d: &Device = Device(raw, false, ctx, cb)
     var cfg: [c.CONFIG_WORDS]u64 = [0; c.CONFIG_WORDS]
     val p: *u8 = ptr_cast(&cfg[0])
 
