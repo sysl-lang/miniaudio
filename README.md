@@ -3,6 +3,8 @@
 Audio playback and capture for sysl, bound to [miniaudio](https://miniaud.io) 0.11.25 — module
 `sh.sysl.miniaudio`.
 
+*An independent sysl package for miniaudio. It is not affiliated with or endorsed by miniaudio's authors or trademark holders.*
+
 ```hocon
 dependencies {
   miniaudio { git = "github.com/sysl-lang/miniaudio", version = "0.1.1" }
